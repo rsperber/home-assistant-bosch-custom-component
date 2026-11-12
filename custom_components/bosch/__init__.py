@@ -296,9 +296,7 @@ class BoschGatewayEntry:
                 FIRMWARE_SCAN_INTERVAL,  # SCAN INTERVAL FV
             )
             async_call_later(self.hass, 5, self.thermostat_refresh)
-            asyncio.run_coroutine_threadsafe(self.recording_sensors_update(),
-                self.hass.loop
-            )
+            self.hass.async_create_task(self.recording_sensors_update())
 
     async def async_init_bosch(self) -> bool:
         """Initialize Bosch gateway module."""
@@ -359,36 +357,40 @@ class BoschGatewayEntry:
         updated = False
         signals = []
         now = dt_util.now()
-        for entity in entities:
-            if entity.enabled:
-                try:
-                    _LOGGER.debug("Updating component 1-hour Sensor by %s", id(self))
-                    await entity.bosch_object.update(time=now)
-                    updated = True
-                    if entity.signal not in signals:
-                        signals.append(entity.signal)
-                except DeviceException as err:
-                    _LOGGER.warning(
-                        "Bosch object of entity %s is no longer available. %s",
-                        entity.name,
-                        err,
-                    )
+        try:
+            for entity in entities:
+                if entity.enabled:
+                    try:
+                        _LOGGER.debug("Updating component 1-hour Sensor by %s", id(self))
+                        await entity.bosch_object.update(time=now)
+                        updated = True
+                        if entity.signal not in signals:
+                            signals.append(entity.signal)
+                    except DeviceException as err:
+                        _LOGGER.warning(
+                            "Bosch object of entity %s is no longer available. %s",
+                            entity.name,
+                            err,
+                        )
+        finally:
+            # Timer was cancelled above, so it has to be re-armed unconditionally:
+            # otherwise any non-DeviceException escaping the loop stops hourly
+            # updates for good.
+            def rounder(t):
+                matching_seconds = [0]
+                matching_minutes = [6]  # 6
+                matching_hours = dt_util.parse_time_expression("*", 0, 23)
+                return dt_util.find_next_time_expression_time(
+                    t, matching_seconds, matching_minutes, matching_hours
+                )
 
-        def rounder(t):
-            matching_seconds = [0]
-            matching_minutes = [6]  # 6
-            matching_hours = dt_util.parse_time_expression("*", 0, 23)
-            return dt_util.find_next_time_expression_time(
-                t, matching_seconds, matching_minutes, matching_hours
+            nexti = rounder(now + timedelta(seconds=1))
+            self.hass.data[DOMAIN][self.uuid][
+                RECORDING_INTERVAL
+            ] = async_track_point_in_utc_time(
+                self.hass, self.recording_sensors_update, nexti
             )
-
-        nexti = rounder(now + timedelta(seconds=1))
-        self.hass.data[DOMAIN][self.uuid][
-            RECORDING_INTERVAL
-        ] = async_track_point_in_utc_time(
-            self.hass, self.recording_sensors_update, nexti
-        )
-        _LOGGER.debug("Next update of 1-hour sensors scheduled at: %s", nexti)
+            _LOGGER.debug("Next update of 1-hour sensors scheduled at: %s", nexti)
         if updated:
             _LOGGER.debug("Bosch 1-hour entitites updated.")
             for signal in signals:
@@ -432,20 +434,79 @@ class BoschGatewayEntry:
                 return True
         return False
 
+    def _entities_to_update(self) -> int:
+        """Number of enabled entities the refresh cycle is supposed to poll."""
+        data = self.hass.data[DOMAIN][self.uuid]
+        return sum(
+            1
+            for component in self.supported_platforms
+            for entity in data.get(component, [])
+            if entity.enabled
+        )
+
+    @callback
+    def _handle_stale_connection(self) -> None:
+        """Reload the entry when every refresh cycle fails, so a dead connector
+        does not leave frozen entities until someone reloads by hand."""
+        self._update_failures += 1
+        if self._update_failures < UPDATE_FAILURES_BEFORE_RELOAD:
+            _LOGGER.warning(
+                "Unable to fetch any data from Bosch in this update cycle "
+                "(%d/%d failures).",
+                self._update_failures,
+                UPDATE_FAILURES_BEFORE_RELOAD,
+            )
+            return
+        self._update_failures = 0
+        _LOGGER.error(
+            "Bosch connector appears to be dead: %d consecutive update cycles "
+            "returned no data. Reloading integration to re-establish the "
+            "connection.",
+            UPDATE_FAILURES_BEFORE_RELOAD,
+        )
+        async_create_persistent_notification(
+            self.hass,
+            title="Bosch connection lost",
+            message=(
+                "Bosch integration stopped receiving data and is reloading "
+                "itself to re-establish the connection."
+            ),
+            notification_id=CONNECTION_NOTIFICATION_ID,
+        )
+        self._connection_notification_created = True
+        self.hass.async_create_task(
+            self.hass.config_entries.async_reload(self.config_entry.entry_id)
+        )
+
     async def thermostat_refresh(self, event_time=None):
         """Call Bosch to refresh information."""
         if self._update_lock.locked():
             _LOGGER.debug("Update already in progress. Not updating.")
             return
         _LOGGER.debug("Updating Bosch thermostat entitites.")
+        updated = False
         async with self._update_lock:
-            await self.component_update(SENSOR, event_time)
-            await self.component_update(BINARY_SENSOR, event_time)
-            await self.component_update(CLIMATE, event_time)
-            await self.component_update(WATER_HEATER, event_time)
-            await self.component_update(SWITCH, event_time)
-            await self.component_update(NUMBER, event_time)
+            for component in (
+                SENSOR,
+                BINARY_SENSOR,
+                CLIMATE,
+                WATER_HEATER,
+                SWITCH,
+                NUMBER,
+                SELECT,
+            ):
+                if await self.component_update(component, event_time):
+                    updated = True
             _LOGGER.debug("Finish updating entities. Waiting for next scheduled check.")
+        if updated:
+            self._update_failures = 0
+            if self._connection_notification_created:
+                self._connection_notification_created = False
+                async_dismiss_persistent_notification(
+                    self.hass, CONNECTION_NOTIFICATION_ID
+                )
+        elif self._entities_to_update() and self.config_entry is not None:
+            self._handle_stale_connection()
 
     async def firmware_refresh(self, event_time=None):
         """Call Bosch to refresh firmware info."""
